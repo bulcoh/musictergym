@@ -75,91 +75,91 @@ def lastfm(method, params):
     except Exception:
         return {}
 
-
 def get_reco(tracks, similarity, adventure, history_keys, log):
     """
-    similarity (0~100): Last.fm similarity score 임계값
-                        높을수록 유사도 높은 곡만 허용
-    adventure  (0~100): 후보 풀 선택 범위 R = 10 + adventure/5
-                        0 → Top10, 100 → Top30
+    similarity (0~100): 낮을수록 더 넓은 범위 허용
+    adventure  (0~100): 낮으면 인기곡, 높으면 hidden gem
     """
     existing = set(f"{t['name'].lower()}|{t['artist'].lower()}" for t in tracks)
     seen     = set(history_keys) | existing
-    reco     = []
-    total    = 0
 
-    # Adventure → 선택 범위 R
-    R = int(10 + adventure / 5)   # 0→10, 100→30
+    # 걔 로직: S 낮으면 limit 넓게
+    search_limit = 40 if similarity < 50 else 20
 
-    # Similarity → 임계값 (0~1 스케일로 변환)
-    # similarity 100 = 최소 0.5 이상만 허용
-    # similarity 0   = 0.0 이상 (전부 허용)
-    sim_threshold = similarity / 200.0   # 100→0.5, 0→0.0
+    # 걔 로직: threshold = (S/100) * 0.2 → 낮을수록 더 허용
+    threshold = (similarity / 100) * 0.2
 
-    # CSV에서 랜덤 시드 선별 (최대 30개)
+    # 랜덤 시드 30개
     seed_pool = random.sample(tracks, min(30, len(tracks)))
 
     log(f"🔍 시드 {len(seed_pool)}곡 → Last.fm track.getsimilar 수집")
-    log(f"   Similarity threshold={sim_threshold:.2f}  Adventure R={R}")
+    log(f"   search_limit={search_limit}  threshold={round(0.2 - threshold, 3)}")
 
-    artist_count = {}
+    candidates = []
 
     for seed in seed_pool:
-        if total >= TARGET_SEC:
-            break
-
         data = lastfm("track.getsimilar", {
-            "artist": seed["artist"],
-            "track":  seed["name"],
-            "limit":  R,          # R개 가져오기
+            "artist":      seed["artist"],
+            "track":       seed["name"],
+            "limit":       search_limit,
             "autocorrect": 1,
         })
 
         similar_tracks = data.get("similartracks", {}).get("track", [])
-        if not similar_tracks:
-            continue
-
-        # similarity score 필터링
-        candidates = []
         for t in similar_tracks:
             score = float(t.get("match", 0))
-            if score < sim_threshold:
+            if score < (0.2 - threshold):
                 continue
-            candidates.append(t)
-
-        # Adventure: 후보 중 랜덤 픽 (범위 넓을수록 하위권도 선택 가능)
-        random.shuffle(candidates)
-
-        for t in candidates:
-            if total >= TARGET_SEC:
-                break
 
             t_name   = t.get("name", "").strip()
-            t_artist = t.get("artist", {}).get("name", "").strip() if isinstance(t.get("artist"), dict) else t.get("artist", "").strip()
+            t_artist = t.get("artist", {}).get("name", "").strip() \
+                       if isinstance(t.get("artist"), dict) \
+                       else t.get("artist", "").strip()
             if not t_name or not t_artist:
                 continue
 
             key = f"{t_name.lower()}|{t_artist.lower()}"
             if key in seen:
                 continue
-
-            # 아티스트당 최대 2곡
-            if artist_count.get(t_artist, 0) >= 2:
-                continue
-
             seen.add(key)
-            dur = int(t.get("duration", 0)) or 210
-            reco.append({"artist": t_artist, "name": t_name,
-                         "dur": dur, "key": key})
-            artist_count[t_artist] = artist_count.get(t_artist, 0) + 1
-            total += dur
 
-    # 최종 셔플
-    random.shuffle(reco)
+            # 리스너 수 조회 (adventure 정렬용)
+            info = lastfm("track.getInfo", {
+                "artist": t_artist, "track": t_name, "autocorrect": 1
+            })
+            listeners = int(info.get("track", {}).get("listeners", 0) or 0)
+
+            dur = int(t.get("duration", 0)) or 210
+            candidates.append({
+                "artist":    t_artist,
+                "name":      t_name,
+                "dur":       dur,
+                "key":       key,
+                "listeners": listeners,
+            })
+
+    # 걔 로직: adventure 낮으면 인기곡, 높으면 hidden gem
+    if adventure <= 50:
+        candidates.sort(key=lambda x: x["listeners"], reverse=True)
+    else:
+        candidates.sort(key=lambda x: x["listeners"])
+
+    # 아티스트당 최대 2곡 + 90분 채우기
+    artist_count = {}
+    reco  = []
+    total = 0
+
+    for r in candidates:
+        if total >= TARGET_SEC:
+            break
+        if artist_count.get(r["artist"], 0) >= 2:
+            continue
+        reco.append(r)
+        artist_count[r["artist"]] = artist_count.get(r["artist"], 0) + 1
+        total += r["dur"]
 
     log(f"  → {len(reco)}곡 / 약 {total//60}분")
     return reco
-
 
 # ══ YouTube 검색 & 다운로드 ═══════════════════════════════════
 def search_and_filter(artist, name):
